@@ -550,26 +550,26 @@ def compute_loss(noise_scheduler, model_prediction, target, latents, noise, time
     return F.mse_loss(model_prediction.float(), target.float(), reduction="mean")
 
 
-def save_image(image, step, output_dir):
+def save_image(image, step, image_id, output_dir):
     """Save the perturbed image using PIL."""
     img_np = image.cpu().detach().numpy().squeeze().transpose(1, 2, 0)
     img = Image.fromarray((img_np * 255).astype('uint8'))
-    img.save(os.path.join(output_dir, f"perturbed_image_step_{step + 1}.png"))
+    img.save(os.path.join(output_dir, f"perturbed_image_{image_id}_step_{step + 1}.png"))
 
 
 def pgd_attack(
-    args,
-    accelerator,
-    models,
-    tokenizer,
-    noise_scheduler,
-    vae,
-    input_image: torch.Tensor,
-    original_image: torch.Tensor,
-    target_tensor: torch.Tensor,
-    weight_dtype=torch.bfloat16,
+        args,
+        accelerator,
+        models,
+        tokenizer,
+        noise_scheduler,
+        vae,
+        data_tensor: torch.Tensor,
+        original_images: torch.Tensor,
+        target_tensor: torch.Tensor,
+        weight_dtype=torch.bfloat16,
 ):
-    """Return new perturbed data for a single image and save images to output directory"""
+    """Return new perturbed data for multiple images and save images to output directory"""
 
     num_steps = args.max_adv_train_steps
     unet, text_encoder = models
@@ -587,60 +587,72 @@ def pgd_attack(
     text_encoder.requires_grad_(False)
     unet.requires_grad_(False)
 
-    perturbed_image = input_image.detach().clone().unsqueeze(0).requires_grad_(True)
-    original_image = original_image.unsqueeze(0)
-    input_ids = tokenizer(
-        args.instance_prompt,
-        truncation=True,
-        padding="max_length",
-        max_length=tokenizer.model_max_length,
-        return_tensors="pt",
-    ).input_ids.to(device)
+    data_tensor = data_tensor.detach().clone()
+    num_images = len(data_tensor)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    for step in range(num_steps):
-        print(f"Step {step + 1}/{num_steps}")
-        perturbed_image.requires_grad_(False)
-        latents = encode_image(vae, perturbed_image, device, weight_dtype)
-        latents.requires_grad_(True)
+    perturbed_images_list = []
+    tbar = tqdm(range(num_images))
+    tbar.set_description("PGD attack")
 
-        noise = torch.randn_like(latents)
-        batch_size = latents.shape[0]
-        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (batch_size,), device=latents.device).long()
-        noisy_latents = add_noise_to_latents(noise_scheduler, latents, noise, timesteps)
+    for image_id in range(num_images):
+        tbar.update(1)
+        perturbed_image = data_tensor[image_id, :].unsqueeze(0).requires_grad_(True)
+        original_image = original_images[image_id, :].unsqueeze(0)
+        input_ids = tokenizer(
+            args.instance_prompt,
+            truncation=True,
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            return_tensors="pt",
+        ).input_ids.to(device)
 
-        encoder_hidden_states = text_encoder(input_ids)[0]
-        model_prediction = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+        for step in range(num_steps):
+            print(f"Image {image_id + 1}, Step {step + 1}/{num_steps}")
+            perturbed_image.requires_grad_(False)
+            latents = encode_image(vae, perturbed_image, device, weight_dtype)
+            latents.requires_grad_(True)
 
-        loss = compute_loss(noise_scheduler, model_prediction, noise, latents, noise, timesteps)
+            noise = torch.randn_like(latents)
+            batch_size = latents.shape[0]
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (batch_size,),
+                                      device=latents.device).long()
+            noisy_latents = add_noise_to_latents(noise_scheduler, latents, noise, timesteps)
 
-        if target_tensor is not None and args.mode != 'anti-db':
-            loss = -F.mse_loss(model_prediction, target_tensor)
-            if args.mode == 'fused':
-                loss -= torch.sum(model_prediction.float() * noise.float())
-                latent_attack = LatentAttack()
-                loss -= 1e2 * latent_attack(latents, target_tensor=target_tensor)
+            encoder_hidden_states = text_encoder(input_ids)[0]
+            model_prediction = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
-        loss /= args.gradient_accumulation_steps
-        grads = autograd.grad(loss, latents)[0].detach().clone()
+            loss = compute_loss(noise_scheduler, model_prediction, noise, latents, noise, timesteps)
 
-        perturbed_image.requires_grad_(True)
-        gc_latents = encode_image(vae, perturbed_image, device, weight_dtype)
-        gc_latents.backward(gradient=grads)
+            if target_tensor is not None and args.mode != 'anti-db':
+                loss = -F.mse_loss(model_prediction, target_tensor)
+                if args.mode == 'fused':
+                    loss -= torch.sum(model_prediction.float() * noise.float())
+                    latent_attack = LatentAttack()
+                    loss -= 1e2 * latent_attack(latents, target_tensor=target_tensor)
 
-        if step % args.gradient_accumulation_steps == args.gradient_accumulation_steps - 1:
-            alpha = args.pgd_alpha
-            adv_images = perturbed_image + alpha * perturbed_image.grad.sign()
-            epsilon = args.pgd_eps
-            eta = torch.clamp(adv_images - original_image, min=-epsilon, max=+epsilon)
-            perturbed_image = torch.clamp(original_image + eta, min=-1, max=+1).detach_().requires_grad_(True)
+            loss /= args.gradient_accumulation_steps
+            grads = autograd.grad(loss, latents)[0].detach().clone()
 
-            save_image(perturbed_image, step, args.output_dir)
+            perturbed_image.requires_grad_(True)
+            gc_latents = encode_image(vae, perturbed_image, device, weight_dtype)
+            gc_latents.backward(gradient=grads)
 
-        print(f"PGD loss - step {step}, loss: {loss.detach().item()}")
+            if step % args.gradient_accumulation_steps == args.gradient_accumulation_steps - 1:
+                alpha = args.pgd_alpha
+                adv_images = perturbed_image + alpha * perturbed_image.grad.sign()
+                epsilon = args.pgd_eps
+                eta = torch.clamp(adv_images - original_image, min=-epsilon, max=+epsilon)
+                perturbed_image = torch.clamp(original_image + eta, min=-1, max=+1).detach_().requires_grad_(True)
 
-    return perturbed_image.detach().squeeze(0)
+                save_image(perturbed_image, step, image_id, args.output_dir)
+
+            print(f"PGD loss - step {step}, loss: {loss.detach().item()}")
+
+        perturbed_images_list.append(perturbed_image.detach().clone().squeeze(0))
+
+    return torch.stack(perturbed_images_list)
 
 
 # Define the main function that takes arguments
