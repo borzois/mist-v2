@@ -540,10 +540,11 @@ def pgd_attack(
         tokenizer,
         noise_scheduler,
         vae,
+        epoch,
         data_tensor: torch.Tensor,
         original_images: torch.Tensor,
         target_tensor: torch.Tensor,
-        weight_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16
 ):
     """Return new perturbed data"""
 
@@ -635,7 +636,7 @@ def pgd_attack(
                 perturbed_image.requires_grad = True
 
                 # Save perturbed image
-                save_path = os.path.join(output_dir, f"image_{id}_step_{step}.png")
+                save_path = os.path.join(output_dir, f"image_{id}_epoch_{epoch}_step_{step}.png")
                 save_image(perturbed_image, save_path)
 
             print(f"PGD loss - step {step}, loss: {loss.detach().item()}")
@@ -860,6 +861,7 @@ def main(args):
             tokenizer,
             noise_scheduler,
             vae,
+            i,
             perturbed_data,
             original_data,
             target_latent_tensor,
