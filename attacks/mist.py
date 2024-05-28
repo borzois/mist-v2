@@ -527,74 +527,52 @@ def train_one_epoch(
     return [unet, text_encoder]
 
 
-def encode_image(vae, image, device, dtype):
-    """Encode an image using the VAE to get its latent representation."""
-    with torch.no_grad():
-        latents = vae.encode(image.to(device, dtype=dtype)).latent_dist.mean
-    return latents.detach().clone() * vae.config.scaling_factor
-
-def get_noisy_latents(noise_scheduler, latents, noise, timesteps):
-    """Add noise to the latents according to the noise magnitude at each timestep."""
-    return noise_scheduler.add_noise(latents, noise, timesteps)
-
-def compute_loss(noise_scheduler, model_pred, target, latents, noise, timesteps):
-    """Compute the loss based on the prediction type."""
-    if noise_scheduler.config.prediction_type == "epsilon":
-        target = noise
-    elif noise_scheduler.config.prediction_type == "v_prediction":
-        target = noise_scheduler.get_velocity(latents, noise, timesteps)
-    else:
-        raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-    return F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
-def save_image(image, step, image_id, output_dir):
-    """Save the perturbed image using PIL."""
-    img_np = image.cpu().detach().numpy().squeeze().transpose(1, 2, 0)
-    img = Image.fromarray((img_np * 255).astype('uint8'))
-    img.save(os.path.join(output_dir, f"perturbed_image_{image_id}_step_{step + 1}.png"))
+def save_image(tensor, file_path):
+    array = tensor.cpu().detach().numpy().squeeze().transpose(1, 2, 0)
+    array = (array - array.min()) / (array.max() - array.min()) * 255  # Normalize to 0-255
+    image = Image.fromarray(array.astype(np.uint8))
+    image.save(file_path)
 
 def pgd_attack(
-    args,
-    accelerator,
-    models,
-    tokenizer,
-    noise_scheduler,
-    vae,
-    data_tensor: torch.Tensor,
-    original_images: torch.Tensor,
-    target_tensor: torch.Tensor,
-    weight_dtype=torch.bfloat16,
+        args,
+        accelerator,
+        models,
+        tokenizer,
+        noise_scheduler,
+        vae,
+        data_tensor: torch.Tensor,
+        original_images: torch.Tensor,
+        target_tensor: torch.Tensor,
+        weight_dtype=torch.bfloat16,
 ):
     """Return new perturbed data"""
 
     num_steps = args.max_adv_train_steps
+
     unet, text_encoder = models
     device = accelerator.device
 
-    # Move models to the specified device and set data types
     vae.to(device, dtype=weight_dtype)
     text_encoder.to(device, dtype=weight_dtype)
     unet.to(device, dtype=weight_dtype)
-
     if args.low_vram_mode:
         unet.set_use_memory_efficient_attention_xformers(True)
-
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     unet.requires_grad_(False)
-
     data_tensor = data_tensor.detach().clone()
     num_image = len(data_tensor)
     image_list = []
-
-    os.makedirs(args.output_dir, exist_ok=True)
-
     tbar = tqdm(range(num_image))
     tbar.set_description("PGD attack")
 
+    output_dir = "perturbed_images"
+    os.makedirs(output_dir, exist_ok=True)
+
     for id in range(num_image):
         print(f"Processing image {id + 1}/{num_image}")
-        perturbed_image = data_tensor[id, :].unsqueeze(0).requires_grad_(True)
+        perturbed_image = data_tensor[id, :].unsqueeze(0)
+        perturbed_image.requires_grad = True
         original_image = original_images[id, :].unsqueeze(0)
         input_ids = tokenizer(
             args.instance_prompt,
@@ -602,36 +580,50 @@ def pgd_attack(
             padding="max_length",
             max_length=tokenizer.model_max_length,
             return_tensors="pt",
-        ).input_ids.to(device)
+        ).input_ids
+        input_ids = input_ids.to(device)
 
         for step in range(num_steps):
             print(f"Step {step + 1}/{num_steps}")
-            perturbed_image.requires_grad_(False)
-            latents = encode_image(vae, perturbed_image, device, weight_dtype)
-            latents.requires_grad_(True)
+            perturbed_image.requires_grad = False
+            with torch.no_grad():
+                latents = vae.encode(perturbed_image.to(device, dtype=weight_dtype)).latent_dist.mean
+            latents = latents.detach().clone()
+            latents.requires_grad = True
+            latents = latents * vae.config.scaling_factor
 
             noise = torch.randn_like(latents)
             bsz = latents.shape[0]
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
-            noisy_latents = get_noisy_latents(noise_scheduler, latents, noise, timesteps)
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+            timesteps = timesteps.long()
 
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
             encoder_hidden_states = text_encoder(input_ids)[0]
             model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
-            loss = compute_loss(noise_scheduler, model_pred, noise, latents, noise, timesteps)
+            if noise_scheduler.config.prediction_type == "epsilon":
+                target = noise
+            elif noise_scheduler.config.prediction_type == "v_prediction":
+                target = noise_scheduler.get_velocity(latents, noise, timesteps)
+            else:
+                raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-            if target_tensor is not None and args.mode != 'anti-db':
-                loss = -F.mse_loss(model_pred, target_tensor)
-                if args.mode == 'fused':
-                    loss -= torch.sum(model_pred.float() * noise.float())
-                    latent_attack = LatentAttack()
-                    loss -= 1e2 * latent_attack(latents, target_tensor=target_tensor)
+            unet.zero_grad()
+            text_encoder.zero_grad()
+            loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-            loss /= args.gradient_accumulation_steps
+            if target_tensor is not None:
+                if args.mode != 'anti-db':
+                    loss = - F.mse_loss(model_pred, target_tensor)
+                    if args.mode == 'fused':
+                        loss = -torch.sum(model_pred.float() * target.float())
+                        latent_attack = LatentAttack()
+                        loss = loss - 1e2 * latent_attack(latents, target_tensor=target_tensor)
+
+            loss = loss / args.gradient_accumulation_steps
             grads = autograd.grad(loss, latents)[0].detach().clone()
-
-            perturbed_image.requires_grad_(True)
-            gc_latents = encode_image(vae, perturbed_image, device, weight_dtype)
+            perturbed_image.requires_grad = True
+            gc_latents = vae.encode(perturbed_image.to(device, dtype=weight_dtype)).latent_dist.mean
             gc_latents.backward(gradient=grads)
 
             if step % args.gradient_accumulation_steps == args.gradient_accumulation_steps - 1:
@@ -639,15 +631,19 @@ def pgd_attack(
                 adv_images = perturbed_image + alpha * perturbed_image.grad.sign()
                 eps = args.pgd_eps
                 eta = torch.clamp(adv_images - original_image, min=-eps, max=+eps)
-                perturbed_image = torch.clamp(original_image + eta, min=-1, max=+1).detach_().requires_grad_(True)
+                perturbed_image = torch.clamp(original_image + eta, min=-1, max=+1).detach_()
+                perturbed_image.requires_grad = True
 
-                save_image(perturbed_image, step, id, args.output_dir)
+                # Save perturbed image
+                save_path = os.path.join(output_dir, f"image_{id}_step_{step}.png")
+                save_image(perturbed_image, save_path)
 
             print(f"PGD loss - step {step}, loss: {loss.detach().item()}")
 
         image_list.append(perturbed_image.detach().clone().squeeze(0))
 
-    return torch.stack(image_list)
+    outputs = torch.stack(image_list)
+    return outputs
 
 
 # Define the main function that takes arguments
