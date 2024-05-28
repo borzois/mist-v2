@@ -36,6 +36,9 @@ from typing import Optional, Tuple
 import pynvml
 # from utils import print_tensor
 
+import matplotlib.pyplot as plt
+
+
 from lora_diffusion import (
     extract_lora_ups_down,
     inject_trainable_lora,
@@ -524,18 +527,17 @@ def train_one_epoch(
     return [unet, text_encoder]
 
 
-
 def pgd_attack(
-    args,
-    accelerator,
-    models,
-    tokenizer,
-    noise_scheduler:DDIMScheduler,
-    vae:AutoencoderKL,
-    data_tensor: torch.Tensor,
-    original_images: torch.Tensor,
-    target_tensor: torch.Tensor,
-    weight_dtype = torch.bfloat16,
+        args,
+        accelerator,
+        models,
+        tokenizer,
+        noise_scheduler,
+        vae,
+        data_tensor: torch.Tensor,
+        original_images: torch.Tensor,
+        target_tensor: torch.Tensor,
+        weight_dtype=torch.bfloat16,
 ):
     """Return new perturbed data"""
 
@@ -557,8 +559,9 @@ def pgd_attack(
     image_list = []
     tbar = tqdm(range(num_image))
     tbar.set_description("PGD attack")
+
     for id in range(num_image):
-        tbar.update(1)
+        print(f"Processing image {id + 1}/{num_image}")
         perturbed_image = data_tensor[id, :].unsqueeze(0)
         perturbed_image.requires_grad = True
         original_image = original_images[id, :].unsqueeze(0)
@@ -570,33 +573,25 @@ def pgd_attack(
             return_tensors="pt",
         ).input_ids
         input_ids = input_ids.to(device)
+
         for step in range(num_steps):
+            print(f"Step {step + 1}/{num_steps}")
             perturbed_image.requires_grad = False
             with torch.no_grad():
                 latents = vae.encode(perturbed_image.to(device, dtype=weight_dtype)).latent_dist.mean
-            #offload vae
             latents = latents.detach().clone()
             latents.requires_grad = True
             latents = latents * vae.config.scaling_factor
 
-            # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
             bsz = latents.shape[0]
-            # Sample a random timestep for each image
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
             timesteps = timesteps.long()
-            
-            # Add noise to the latents according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
+
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-            # Get the text embedding for conditioning
             encoder_hidden_states = text_encoder(input_ids)[0]
-
-            # Predict the noise residual
             model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
-            # Get the target for loss depending on the prediction type
             if noise_scheduler.config.prediction_type == "epsilon":
                 target = noise
             elif noise_scheduler.config.prediction_type == "v_prediction":
@@ -608,26 +603,20 @@ def pgd_attack(
             text_encoder.zero_grad()
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-            # target-shift loss
             if target_tensor is not None:
                 if args.mode != 'anti-db':
                     loss = - F.mse_loss(model_pred, target_tensor)
-                    # fused mode
                     if args.mode == 'fused':
                         loss = -torch.sum(model_pred.float() * target.float())
-                        
                         latent_attack = LatentAttack()
-                        loss = loss - 1e2 * latent_attack(latents, target_tensor=target_tensor)            
+                        loss = loss - 1e2 * latent_attack(latents, target_tensor=target_tensor)
 
             loss = loss / args.gradient_accumulation_steps
             grads = autograd.grad(loss, latents)[0].detach().clone()
-            # now loss is backproped to latents
-            #print('grads: {}'.format(grads))
-            #do forward on vae again
             perturbed_image.requires_grad = True
             gc_latents = vae.encode(perturbed_image.to(device, dtype=weight_dtype)).latent_dist.mean
             gc_latents.backward(gradient=grads)
-            
+
             if step % args.gradient_accumulation_steps == args.gradient_accumulation_steps - 1:
                 alpha = args.pgd_alpha
                 adv_images = perturbed_image + alpha * perturbed_image.grad.sign()
@@ -636,13 +625,17 @@ def pgd_attack(
                 perturbed_image = torch.clamp(original_image + eta, min=-1, max=+1).detach_()
                 perturbed_image.requires_grad = True
 
-                    
-            #print(f"PGD loss - step {step}, loss: {loss.detach().item()}")
+                # Display perturbed image
+                perturbed_img_np = perturbed_image.cpu().detach().numpy().squeeze().transpose(1, 2, 0)
+                plt.imshow(perturbed_img_np)
+                plt.title(f"Step {step + 1}/{num_steps}")
+                plt.show()
+
+            print(f"PGD loss - step {step}, loss: {loss.detach().item()}")
 
         image_list.append(perturbed_image.detach().clone().squeeze(0))
+
     outputs = torch.stack(image_list)
-
-
     return outputs
 
 
@@ -850,7 +843,9 @@ def main(args):
     # Main training loop
     f = [unet, text_encoder]
     for i in range(args.max_train_steps):
+        # pgd_attack probably uses f in a destructive manner - pass it a copy
         f_sur = copy.deepcopy(f)
+
         perturbed_data = pgd_attack(
             args,
             accelerator,
@@ -863,9 +858,12 @@ def main(args):
             target_latent_tensor,
             weight_dtype,
         )
+        # then delete it
         del f_sur
+
         if args.cuda:
             gc.collect()
+
         f = train_one_epoch(
             args,
             accelerator,
